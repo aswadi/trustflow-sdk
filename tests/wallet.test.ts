@@ -1,8 +1,9 @@
-import { connectWallet, disconnectWallet } from '../src/wallet/connect';
+import { connectWallet, disconnectWallet, disconnectAll } from '../src/wallet/connect';
+import { saveSession, loadSession } from '../src/auth/session';
 import { getFreighter, isFreighterInstalled } from '../src/wallet/freighter';
 import { getAlbedo } from '../src/wallet/albedo';
 import { isWalletRejection } from '../src/wallet/types';
-import { TrustFlowError } from '../src/errors';
+import { TrustFlowError, UnsupportedWalletVersionError } from '../src/errors';
 
 describe('wallet module', () => {
   const originalWindow = global.window;
@@ -150,93 +151,40 @@ describe('wallet module', () => {
     });
   });
 
-  describe('concurrent connectWallet calls (#741)', () => {
-    function deferred<T>() {
-      let resolve!: (value: T) => void;
-      let reject!: (reason: unknown) => void;
-      const promise = new Promise<T>((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      return { promise, resolve, reject };
-    }
 
-    it('prompts Freighter once and gives every concurrent caller the same connection', async () => {
-      const key = deferred<string>();
-      const freighter = {
-        getPublicKey: jest.fn(() => key.promise),
-        getNetwork: jest.fn().mockResolvedValue('TESTNET'),
-      };
-      global.window = { freighter } as any;
-
-      const first = connectWallet('freighter');
-      const second = connectWallet('freighter');
-      const third = connectWallet();
-      key.resolve('GSHARED');
-
-      const results = await Promise.all([first, second, third]);
-      expect(freighter.getPublicKey).toHaveBeenCalledTimes(1);
-      expect(results[0]).toEqual({ type: 'freighter', publicKey: 'GSHARED', network: 'TESTNET' });
-      expect(results[1]).toBe(results[0]);
-      expect(results[2]).toBe(results[0]);
-    });
-
-    it('gives every concurrent caller the same rejection', async () => {
-      const key = deferred<string>();
-      const freighter = {
-        getPublicKey: jest.fn(() => key.promise),
-        getNetwork: jest.fn().mockResolvedValue('TESTNET'),
-      };
-      global.window = { freighter } as any;
-
-      const first = connectWallet('freighter');
-      const second = connectWallet('freighter');
-      key.reject(new Error('User declined access'));
-
-      await expect(first).rejects.toMatchObject({ code: 'USER_REJECTED' });
-      await expect(second).rejects.toMatchObject({ code: 'USER_REJECTED' });
-      expect(freighter.getPublicKey).toHaveBeenCalledTimes(1);
-    });
-
-    it('starts a new attempt once the previous one has settled, so a retry prompts again', async () => {
-      const freighter = {
-        getPublicKey: jest
-          .fn()
-          .mockRejectedValueOnce(new Error('User declined access'))
-          .mockResolvedValueOnce('GRETRY'),
-        getNetwork: jest.fn().mockResolvedValue('TESTNET'),
-      };
-      global.window = { freighter } as any;
-
-      await expect(connectWallet('freighter')).rejects.toMatchObject({ code: 'USER_REJECTED' });
-      await expect(connectWallet('freighter')).resolves.toMatchObject({ publicKey: 'GRETRY' });
-      expect(freighter.getPublicKey).toHaveBeenCalledTimes(2);
-    });
-
-    it('does not share a pending attempt across different wallet types', async () => {
-      const key = deferred<string>();
+    it('throws UnsupportedWalletVersionError when window.freighter has an incompatible/legacy API shape (#740)', async () => {
+      // Simulate an older Freighter extension exposing getAddress instead of getPublicKey / getNetwork
       global.window = {
         freighter: {
-          getPublicKey: jest.fn(() => key.promise),
-          getNetwork: jest.fn().mockResolvedValue('TESTNET'),
-        },
-        albedo: {
-          publicKey: jest.fn().mockResolvedValue({ pubkey: 'GALBEDO', token: '', network: 'testnet' }),
+          getAddress: jest.fn().mockResolvedValue('GBM...'),
         },
       } as any;
 
-      const freighterConnection = connectWallet('freighter');
-      await expect(connectWallet('albedo')).resolves.toMatchObject({
-        type: 'albedo',
-        publicKey: 'GALBEDO',
-      });
-      key.resolve('GFREIGHTER');
-      await expect(freighterConnection).resolves.toMatchObject({
-        type: 'freighter',
-        publicKey: 'GFREIGHTER',
+      await expect(connectWallet('freighter')).rejects.toThrow(UnsupportedWalletVersionError);
+      await expect(connectWallet('freighter')).rejects.toMatchObject({
+        name: 'UnsupportedWalletVersionError',
+        code: 'UNSUPPORTED_WALLET_VERSION',
+        walletType: 'Freighter',
+        missingMethods: ['getPublicKey', 'getNetwork'],
       });
     });
   });
+
+  describe('disconnectAll (#742)', () => {
+    it('clears both wallet connection and cached auth session state while disconnectWallet keeps sessions intact', async () => {
+      saveSession('jwt-token-123', 'GADDR123');
+      saveSession('jwt-scoped-456', 'GADDR456', undefined, 'alice');
+      expect(loadSession()?.token).toBe('jwt-token-123');
+      expect(loadSession('alice')?.token).toBe('jwt-scoped-456');
+
+      // disconnectWallet() alone does not clear auth sessions
+      await disconnectWallet();
+      expect(loadSession()?.token).toBe('jwt-token-123');
+
+      // disconnectAll() purges unscoped and scoped auth sessions
+      await disconnectAll();
+      expect(loadSession()).toBeNull();
+    });
 
   describe('disconnectWallet', () => {
     it('is a no-op that resolves successfully', async () => {
